@@ -2,6 +2,7 @@ import os, re
 import logging
 import time
 import requests
+import asyncio
 from collections import defaultdict
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
@@ -9,6 +10,15 @@ from slack_sdk.errors import SlackApiError
 from flask import Flask, request
 from openai import OpenAI
 from anthropic import Anthropic
+
+# Try to import MCP, but gracefully handle if not available
+try:
+    from mcp import ClientSession
+    from mcp.client.sse import sse_client
+    MCP_AVAILABLE = True
+except ImportError:
+    MCP_AVAILABLE = False
+    logging.warning("MCP not available, will use direct API only")
 
 # Required environment variables (fail fast with a clear error if missing)
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
@@ -66,9 +76,14 @@ if ANTHROPIC_API_KEY:
 task_suggestions = defaultdict(list)  # channel_id -> [timestamps]
 SUGGESTION_COOLDOWN = 300  # 5 minutes between suggestions per channel
 
-# Notion API configuration
+# Notion configuration
 NOTION_API_URL = "https://api.notion.com/v1"
+NOTION_MCP_URL = "https://mcp.notion.com/sse"
 NOTION_VERSION = "2022-06-28"
+
+# Global state
+notion_session = None
+notion_mcp_available = False
 
 def strip_mention(text: str) -> str:
     return re.sub(r"<@[^>]+>\s*", "", text or "").strip()
@@ -181,6 +196,94 @@ def record_task_suggestion(channel_id: str):
     """Record that we made a task suggestion"""
     task_suggestions[channel_id].append(time.time())
 
+async def init_notion_mcp():
+    """Initialize Notion MCP connection with OAuth support"""
+    global notion_session, notion_mcp_available
+    
+    if not MCP_AVAILABLE:
+        logging.info("MCP library not available, using direct API only")
+        return False
+    
+    if not NOTION_ACCESS_TOKEN:
+        logging.warning("No Notion access token provided, skipping MCP connection")
+        return False
+        
+    try:
+        # For now, try connecting without OAuth (this will likely fail)
+        # TODO: Implement proper OAuth flow
+        headers = {
+            "Authorization": f"Bearer {NOTION_ACCESS_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        
+        # Connect to Notion MCP server
+        session, write, read = await sse_client(NOTION_MCP_URL, headers=headers)
+        notion_session = session
+        
+        # Initialize the session
+        await session.initialize()
+        notion_mcp_available = True
+        logging.info("Notion MCP connection established")
+        return True
+        
+    except Exception as e:
+        logging.warning(f"Notion MCP connection failed: {e}")
+        logging.info("Will use direct Notion API as fallback")
+        notion_mcp_available = False
+        return False
+
+async def create_notion_task_mcp(task_title: str, task_description: str, slack_channel: str, slack_user: str) -> str:
+    """Create a task in Notion via MCP"""
+    if not notion_session:
+        return None  # Will trigger fallback
+    
+    try:
+        # List available tools
+        tools_result = await notion_session.list_tools()
+        logging.info(f"Available Notion MCP tools: {[tool.name for tool in tools_result.tools]}")
+        
+        # Try to create a page using MCP tools
+        task_content = f"""**Task detected from Slack**
+
+**Description:** {task_description}
+
+**Source:** #{slack_channel} (by {slack_user})
+**Created:** {time.strftime('%Y-%m-%d %H:%M:%S')}
+
+**Status:** Todo
+"""
+        
+        # This depends on actual MCP tool names - will need adjustment
+        create_result = await notion_session.call_tool(
+            "create_page", 
+            {
+                "title": task_title,
+                "content": task_content
+            }
+        )
+        
+        return f"✅ Task created in Notion via MCP: {task_title}"
+        
+    except Exception as e:
+        logging.error(f"MCP task creation failed: {e}")
+        return None  # Will trigger fallback
+
+def run_async_task(coro):
+    """Helper to run async tasks in sync context"""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    if loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(asyncio.run, coro)
+            return future.result()
+    else:
+        return loop.run_until_complete(coro)
+
 def test_notion_connection():
     """Test connection to Notion API"""
     if not NOTION_ACCESS_TOKEN:
@@ -266,6 +369,24 @@ def create_notion_page(task_title: str, task_description: str, slack_channel: st
         logging.error(f"Failed to create Notion page: {e}")
         return f"❌ Error creating Notion page: {str(e)}"
 
+def create_notion_task(task_title: str, task_description: str, slack_channel: str, slack_user: str) -> str:
+    """Create a task in Notion - tries MCP first, falls back to direct API"""
+    
+    # Try MCP first if available
+    if notion_mcp_available and notion_session:
+        try:
+            result = run_async_task(create_notion_task_mcp(
+                task_title, task_description, slack_channel, slack_user
+            ))
+            if result:  # MCP succeeded
+                return result
+        except Exception as e:
+            logging.warning(f"MCP creation failed, falling back to direct API: {e}")
+    
+    # Fallback to direct API
+    logging.info("Using direct Notion API for task creation")
+    return create_notion_page(task_title, task_description, slack_channel, slack_user)
+
 @bolt_app.event("app_mention")
 def on_mention(body, say, ack):
     ack()  # respond to Slack within 3 seconds
@@ -285,8 +406,8 @@ def on_mention(body, say, ack):
             # Generate a task title from the description
             task_title = task_text[:50] + "..." if len(task_text) > 50 else task_text
             
-            # Create task in Notion
-            result = create_notion_page(
+            # Create task in Notion (tries MCP first, falls back to API)
+            result = create_notion_task(
                 task_title=task_title,
                 task_description=task_text,
                 slack_channel=channel_name,
@@ -383,7 +504,16 @@ def health():
     return "ok", 200
 
 if __name__ == "__main__":
-    # Test Notion API connection
+    # Try to initialize Notion MCP connection
+    if MCP_AVAILABLE:
+        try:
+            mcp_success = run_async_task(init_notion_mcp())
+            if not mcp_success:
+                logging.info("MCP connection failed, will use direct API")
+        except Exception as e:
+            logging.warning(f"Could not initialize Notion MCP: {e}")
+    
+    # Test direct API connection as fallback
     test_notion_connection()
     
     port = int(os.environ.get("PORT", "3000"))
