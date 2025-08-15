@@ -14,12 +14,23 @@ from anthropic import Anthropic
 # Try to import MCP, but gracefully handle if not available
 try:
     import mcp
+    logging.info("✅ MCP base package imported successfully")
+    
     from mcp import ClientSession
+    logging.info("✅ MCP ClientSession imported successfully")
+    
     from mcp.client.sse import sse_client
+    logging.info("✅ MCP SSE client imported successfully")
+    
     from mcp.client.streamable_http import streamablehttp_client
+    logging.info("✅ MCP streamable HTTP client imported successfully")
+    
     MCP_AVAILABLE = True
-except ImportError:
+    logging.info("✅ All MCP imports successful - MCP available")
+    
+except ImportError as e:
     MCP_AVAILABLE = False
+    logging.error(f"❌ MCP import failed: {e}")
     logging.warning("MCP not available, will use direct API only")
 
 # Required environment variables (fail fast with a clear error if missing)
