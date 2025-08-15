@@ -1,6 +1,7 @@
 import os, re
 import logging
 import time
+import asyncio
 from collections import defaultdict
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
@@ -8,12 +9,15 @@ from slack_sdk.errors import SlackApiError
 from flask import Flask, request
 from openai import OpenAI
 from anthropic import Anthropic
+from mcp import ClientSession
+from mcp.client.sse import sse_client
 
 # Required environment variables (fail fast with a clear error if missing)
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+NOTION_ACCESS_TOKEN = os.environ.get("NOTION_ACCESS_TOKEN")
 
 # At least one AI service API key is required
 _missing_env = [
@@ -63,6 +67,10 @@ if ANTHROPIC_API_KEY:
 # Task detection tracking
 task_suggestions = defaultdict(list)  # channel_id -> [timestamps]
 SUGGESTION_COOLDOWN = 300  # 5 minutes between suggestions per channel
+
+# Notion MCP configuration
+NOTION_MCP_URL = "https://mcp.notion.com/sse"
+notion_session = None
 
 def strip_mention(text: str) -> str:
     return re.sub(r"<@[^>]+>\s*", "", text or "").strip()
@@ -175,6 +183,89 @@ def record_task_suggestion(channel_id: str):
     """Record that we made a task suggestion"""
     task_suggestions[channel_id].append(time.time())
 
+async def init_notion_mcp():
+    """Initialize Notion MCP connection"""
+    global notion_session
+    
+    if not NOTION_ACCESS_TOKEN:
+        logging.warning("No Notion access token provided, skipping MCP connection")
+        return False
+        
+    try:
+        # Add authentication headers for Notion MCP
+        headers = {
+            "Authorization": f"Bearer {NOTION_ACCESS_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        
+        # Connect to Notion MCP server with auth
+        session, write, read = await sse_client(NOTION_MCP_URL, headers=headers)
+        notion_session = session
+        
+        # Initialize the session
+        await session.initialize()
+        logging.info("Notion MCP connection established")
+        return True
+        
+    except Exception as e:
+        logging.error(f"Failed to connect to Notion MCP: {e}")
+        return False
+
+async def create_notion_task(task_title: str, task_description: str, slack_channel: str, slack_user: str) -> str:
+    """Create a task in Notion via MCP"""
+    if not notion_session:
+        return "Notion connection not available"
+    
+    try:
+        # List available tools to see what we can do
+        tools_result = await notion_session.list_tools()
+        logging.info(f"Available Notion tools: {[tool.name for tool in tools_result.tools]}")
+        
+        # Try to create a page (this depends on the actual Notion MCP tools available)
+        # This is a placeholder - we'll need to adjust based on actual Notion MCP API
+        task_content = f"""**Task detected from Slack**
+
+**Description:** {task_description}
+
+**Source:** #{slack_channel} (by {slack_user})
+**Created:** {time.strftime('%Y-%m-%d %H:%M:%S')}
+
+**Status:** Todo
+"""
+        
+        # Attempt to create a page (exact method depends on Notion MCP implementation)
+        create_result = await notion_session.call_tool(
+            "create_page",
+            {
+                "title": task_title,
+                "content": task_content,
+                "parent_database_id": None  # Would need to be configured
+            }
+        )
+        
+        return f"✅ Task created in Notion: {task_title}"
+        
+    except Exception as e:
+        logging.error(f"Failed to create Notion task: {e}")
+        return f"❌ Failed to create task in Notion: {str(e)}"
+
+def run_async_task(coro):
+    """Helper to run async tasks in sync context"""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    if loop.is_running():
+        # If loop is already running, create a new thread
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(asyncio.run, coro)
+            return future.result()
+    else:
+        return loop.run_until_complete(coro)
+
 @bolt_app.event("app_mention")
 def on_mention(body, say, ack):
     ack()  # respond to Slack within 3 seconds
@@ -183,6 +274,32 @@ def on_mention(body, say, ack):
         "user": body.get("event", {}).get("user"),
     })
     user_text = strip_mention(body["event"]["text"])
+    
+    # Check for task creation commands
+    if user_text.lower().startswith("create task:") or user_text.lower().startswith("task:"):
+        task_text = user_text.split(":", 1)[1].strip()
+        channel_name = body.get("event", {}).get("channel", "unknown")
+        user_id = body.get("event", {}).get("user", "unknown")
+        
+        try:
+            # Generate a task title from the description
+            task_title = task_text[:50] + "..." if len(task_text) > 50 else task_text
+            
+            # Create task in Notion
+            result = run_async_task(create_notion_task(
+                task_title=task_title,
+                task_description=task_text,
+                slack_channel=channel_name,
+                slack_user=user_id
+            ))
+            
+            say(result, thread_ts=body["event"]["ts"])
+            return
+            
+        except Exception as e:
+            logging.error(f"Error creating Notion task: {e}")
+            say(f"❌ Error creating task: {str(e)}", thread_ts=body["event"]["ts"])
+            return
     
     # Check if user wants to specify which AI to use
     prefer_claude = True  # Default to Claude
@@ -243,8 +360,8 @@ def on_message(body, event, say, ack):
             record_task_suggestion(channel_id)
             
             suggestion_text = ("👋 It sounds like there might be a task here. "
-                             "Should I help track this as an action item? "
-                             "Just mention me to get started!")
+                             "Want me to create it in Notion? Just mention me with:\n"
+                             "`@bot task: your task description`")
             
             # Reply in thread to the original message
             try:
@@ -266,5 +383,11 @@ def health():
     return "ok", 200
 
 if __name__ == "__main__":
+    # Initialize Notion MCP connection
+    try:
+        run_async_task(init_notion_mcp())
+    except Exception as e:
+        logging.warning(f"Could not initialize Notion MCP: {e}")
+    
     port = int(os.environ.get("PORT", "3000"))
     flask_app.run(host="0.0.0.0", port=port)
