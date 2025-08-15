@@ -26,6 +26,8 @@ SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 NOTION_ACCESS_TOKEN = os.environ.get("NOTION_ACCESS_TOKEN")
+SMITHERY_API_KEY = os.environ.get("SMITHERY_API_KEY")
+SMITHERY_PROFILE = os.environ.get("SMITHERY_PROFILE")
 
 # At least one AI service API key is required
 _missing_env = [
@@ -79,6 +81,7 @@ SUGGESTION_COOLDOWN = 300  # 5 minutes between suggestions per channel
 # Notion configuration
 NOTION_API_URL = "https://api.notion.com/v1"
 NOTION_MCP_URL = "https://mcp.notion.com/sse"
+SMITHERY_MCP_URL = "https://server.smithery.ai/@smithery/notion/mcp"
 NOTION_VERSION = "2022-06-28"
 
 # Global state
@@ -197,40 +200,66 @@ def record_task_suggestion(channel_id: str):
     task_suggestions[channel_id].append(time.time())
 
 async def init_notion_mcp():
-    """Initialize Notion MCP connection with OAuth support"""
+    """Initialize Notion MCP connection - tries Smithery first, then official MCP"""
     global notion_session, notion_mcp_available
     
     if not MCP_AVAILABLE:
         logging.info("MCP library not available, using direct API only")
         return False
     
-    if not NOTION_ACCESS_TOKEN:
-        logging.warning("No Notion access token provided, skipping MCP connection")
-        return False
-        
-    try:
-        # For now, try connecting without OAuth (this will likely fail)
-        # TODO: Implement proper OAuth flow
-        headers = {
-            "Authorization": f"Bearer {NOTION_ACCESS_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        
-        # Connect to Notion MCP server
-        session, write, read = await sse_client(NOTION_MCP_URL, headers=headers)
-        notion_session = session
-        
-        # Initialize the session
-        await session.initialize()
-        notion_mcp_available = True
-        logging.info("Notion MCP connection established")
-        return True
-        
-    except Exception as e:
-        logging.warning(f"Notion MCP connection failed: {e}")
-        logging.info("Will use direct Notion API as fallback")
-        notion_mcp_available = False
-        return False
+    # Try Smithery MCP first if configured
+    if SMITHERY_API_KEY and SMITHERY_PROFILE:
+        try:
+            logging.info("Attempting connection to Smithery Notion MCP server")
+            
+            # Construct URL with API key and profile
+            smithery_url = f"{SMITHERY_MCP_URL}?api_key={SMITHERY_API_KEY}&profile={SMITHERY_PROFILE}"
+            
+            # Connect to Smithery MCP server (try both SSE and HTTP)
+            try:
+                session, write, read = await sse_client(smithery_url)
+            except Exception as sse_error:
+                logging.info(f"SSE connection failed, trying HTTP: {sse_error}")
+                # Try HTTP if SSE fails
+                from mcp.client.http import http_client
+                session, write, read = await http_client(smithery_url)
+            
+            notion_session = session
+            
+            # Initialize the session
+            await session.initialize()
+            notion_mcp_available = True
+            logging.info("✅ Smithery Notion MCP connection established")
+            return True
+            
+        except Exception as e:
+            logging.warning(f"Smithery MCP connection failed: {e}")
+    
+    # Fallback to official Notion MCP if we have a token
+    if NOTION_ACCESS_TOKEN:
+        try:
+            logging.info("Attempting connection to official Notion MCP server")
+            headers = {
+                "Authorization": f"Bearer {NOTION_ACCESS_TOKEN}",
+                "Content-Type": "application/json"
+            }
+            
+            # Connect to official Notion MCP server
+            session, write, read = await sse_client(NOTION_MCP_URL, headers=headers)
+            notion_session = session
+            
+            # Initialize the session
+            await session.initialize()
+            notion_mcp_available = True
+            logging.info("✅ Official Notion MCP connection established")
+            return True
+            
+        except Exception as e:
+            logging.warning(f"Official Notion MCP connection failed: {e}")
+    
+    logging.info("All MCP connection attempts failed, will use direct Notion API as fallback")
+    notion_mcp_available = False
+    return False
 
 async def create_notion_task_mcp(task_title: str, task_description: str, slack_channel: str, slack_user: str) -> str:
     """Create a task in Notion via MCP"""
