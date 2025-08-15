@@ -13,8 +13,10 @@ from anthropic import Anthropic
 
 # Try to import MCP, but gracefully handle if not available
 try:
+    import mcp
     from mcp import ClientSession
     from mcp.client.sse import sse_client
+    from mcp.client.streamable_http import streamablehttp_client
     MCP_AVAILABLE = True
 except ImportError:
     MCP_AVAILABLE = False
@@ -210,30 +212,30 @@ async def init_notion_mcp():
     # Try Smithery MCP first if configured
     if SMITHERY_API_KEY and SMITHERY_PROFILE:
         try:
-            logging.info("Attempting connection to Smithery Notion MCP server")
+            logging.info("Attempting connection to Smithery Notion MCP server using streamable HTTP")
             
-            # Construct URL with API key and profile
+            # Construct URL exactly as shown in Smithery SDK example
             smithery_url = f"{SMITHERY_MCP_URL}?api_key={SMITHERY_API_KEY}&profile={SMITHERY_PROFILE}"
             
-            # Connect to Smithery MCP server (try both SSE and HTTP)
-            try:
-                session, write, read = await sse_client(smithery_url)
-            except Exception as sse_error:
-                logging.info(f"SSE connection failed, trying HTTP: {sse_error}")
-                # Try HTTP if SSE fails
-                from mcp.client.http import http_client
-                session, write, read = await http_client(smithery_url)
+            # Use the exact pattern from Smithery's SDK example
+            read_stream, write_stream, _ = await streamablehttp_client(smithery_url).__aenter__()
+            session = mcp.ClientSession(read_stream, write_stream)
+            await session.__aenter__()
+            
+            # Initialize the connection
+            await session.initialize()
+            
+            # Test available tools
+            tools_result = await session.list_tools()
+            logging.info(f"✅ Smithery MCP connected! Available tools: {[tool.name for tool in tools_result.tools]}")
             
             notion_session = session
-            
-            # Initialize the session
-            await session.initialize()
             notion_mcp_available = True
-            logging.info("✅ Smithery Notion MCP connection established")
             return True
             
         except Exception as e:
             logging.warning(f"Smithery MCP connection failed: {e}")
+            logging.info("Falling back to other connection methods")
     
     # Fallback to official Notion MCP if we have a token
     if NOTION_ACCESS_TOKEN:
@@ -267,31 +269,59 @@ async def create_notion_task_mcp(task_title: str, task_description: str, slack_c
         return None  # Will trigger fallback
     
     try:
-        # List available tools
+        # List available tools to see what we have
         tools_result = await notion_session.list_tools()
-        logging.info(f"Available Notion MCP tools: {[tool.name for tool in tools_result.tools]}")
+        available_tools = [tool.name for tool in tools_result.tools]
+        logging.info(f"Available Notion MCP tools: {available_tools}")
         
-        # Try to create a page using MCP tools
-        task_content = f"""**Task detected from Slack**
+        # Try to use appropriate tool based on what's available
+        task_content = f"""Task detected from Slack
 
-**Description:** {task_description}
+Description: {task_description}
 
-**Source:** #{slack_channel} (by {slack_user})
-**Created:** {time.strftime('%Y-%m-%d %H:%M:%S')}
+Source: #{slack_channel} (by {slack_user})
+Created: {time.strftime('%Y-%m-%d %H:%M:%S')}
 
-**Status:** Todo
-"""
+Status: Todo"""
         
-        # This depends on actual MCP tool names - will need adjustment
-        create_result = await notion_session.call_tool(
-            "create_page", 
-            {
-                "title": task_title,
-                "content": task_content
-            }
-        )
+        # Try different tool names that might be available
+        create_result = None
         
-        return f"✅ Task created in Notion via MCP: {task_title}"
+        if "create-page" in available_tools:
+            create_result = await notion_session.call_tool(
+                "create-page", 
+                {
+                    "title": task_title,
+                    "content": task_content
+                }
+            )
+        elif "create_page" in available_tools:
+            create_result = await notion_session.call_tool(
+                "create_page", 
+                {
+                    "title": task_title,
+                    "content": task_content
+                }
+            )
+        else:
+            # Try the first available tool that looks like it creates content
+            create_tools = [t for t in available_tools if 'create' in t.lower()]
+            if create_tools:
+                logging.info(f"Trying tool: {create_tools[0]}")
+                create_result = await notion_session.call_tool(
+                    create_tools[0], 
+                    {
+                        "title": task_title,
+                        "content": task_content
+                    }
+                )
+        
+        if create_result:
+            logging.info(f"MCP task creation result: {create_result}")
+            return f"✅ Task created in Notion via MCP: {task_title}"
+        else:
+            logging.warning("No suitable create tool found in MCP")
+            return None
         
     except Exception as e:
         logging.error(f"MCP task creation failed: {e}")
